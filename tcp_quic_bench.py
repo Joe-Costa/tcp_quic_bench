@@ -35,6 +35,33 @@ from aioquic.asyncio.protocol import QuicConnectionProtocol
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.events import StreamDataReceived
 
+# Detect best available QUIC congestion control algorithm
+def _get_quic_cc_algorithm() -> str:
+    """Return 'bbr' if available, otherwise 'reno'."""
+    try:
+        # Try to import BBR directly - this forces registration
+        from aioquic.quic.congestion.bbr import BbrCongestionControl  # noqa: F401
+        return "bbr"
+    except ImportError:
+        return "reno"
+
+QUIC_CC_ALGORITHM = _get_quic_cc_algorithm()
+
+
+# -----------------------------
+# Size parsing
+# -----------------------------
+
+def parse_size(s: str) -> int:
+    """Parse human-readable size (e.g., '100MB', '1G', '500K') to bytes."""
+    s = s.strip().upper()
+    units = {'B': 1, 'K': 1024, 'KB': 1024, 'M': 1024**2, 'MB': 1024**2,
+             'G': 1024**3, 'GB': 1024**3, 'T': 1024**4, 'TB': 1024**4}
+    for suffix, mult in sorted(units.items(), key=lambda x: -len(x[0])):
+        if s.endswith(suffix):
+            return int(float(s[:-len(suffix)]) * mult)
+    return int(s)  # Assume bytes if no suffix
+
 
 # -----------------------------
 # Common data structures
@@ -239,21 +266,59 @@ def _netem_cleanup_handler(signum=None, frame=None):
 
 async def handle_tcp_throughput(reader: asyncio.StreamReader,
                                 writer: asyncio.StreamWriter):
+    """
+    Bidirectional throughput handler.
+    Client sends control line: "UPLOAD <bytes>\n" or "DOWNLOAD <bytes>\n"
+    """
     addr = writer.get_extra_info("peername")
-    start = time.perf_counter()
-    total = 0
     try:
-        while True:
-            data = await reader.read(64 * 1024)
-            if not data:
-                break
-            total += len(data)
+        # Read control line
+        line = await reader.readline()
+        if not line:
+            return
+        parts = line.decode().strip().split()
+        if len(parts) != 2:
+            print(f"[TCP throughput] {addr} -> invalid control line: {line}")
+            return
+        cmd, size_str = parts
+        size = int(size_str)
+
+        if cmd == "UPLOAD":
+            # Receive data from client
+            start = time.perf_counter()
+            total = 0
+            while total < size:
+                data = await reader.read(64 * 1024)
+                if not data:
+                    break
+                total += len(data)
+            end = time.perf_counter()
+            duration = max(end - start, 1e-9)
+            mbps = total * 8 / duration / 1e6
+            print(f"[TCP throughput] {addr} -> received {total} bytes "
+                  f"in {duration:.3f}s ({mbps:.2f} Mbit/s)")
+
+        elif cmd == "DOWNLOAD":
+            # Send data to client
+            chunk_size = 64 * 1024
+            payload = os.urandom(chunk_size)
+            sent = 0
+            start = time.perf_counter()
+            while sent < size:
+                remaining = size - sent
+                buf = payload if remaining >= chunk_size else payload[:remaining]
+                writer.write(buf)
+                await writer.drain()
+                sent += len(buf)
+            end = time.perf_counter()
+            duration = max(end - start, 1e-9)
+            mbps = sent * 8 / duration / 1e6
+            print(f"[TCP throughput] {addr} -> sent {sent} bytes "
+                  f"in {duration:.3f}s ({mbps:.2f} Mbit/s)")
+
+    except Exception as e:
+        print(f"[TCP throughput] {addr} -> error: {e}")
     finally:
-        end = time.perf_counter()
-        duration = max(end - start, 1e-9)
-        mbps = total * 8 / duration / 1e6
-        print(f"[TCP throughput] {addr} -> received {total} bytes "
-              f"in {duration:.3f}s ({mbps:.2f} Mbit/s)")
         writer.close()
         await writer.wait_closed()
 
@@ -296,26 +361,96 @@ class BenchmarkQuicServerProtocol(QuicConnectionProtocol):
     """
     QUIC server protocol.
 
-    - throughput: consume data on streams and discard.
+    - throughput: bidirectional data transfer (upload/download).
     - rtt: echo data back on the same stream.
     """
     def __init__(self, *args, mode: str = "throughput", **kwargs):
         super().__init__(*args, **kwargs)
         self.mode = mode
+        # Per-stream state for throughput
+        self._stream_state: dict[int, dict] = {}
+
+    def _get_stream_state(self, stream_id: int) -> dict:
+        if stream_id not in self._stream_state:
+            self._stream_state[stream_id] = {
+                "buffer": b"",
+                "cmd": None,
+                "size": 0,
+                "bytes_transferred": 0,
+                "start_time": None,
+            }
+        return self._stream_state[stream_id]
 
     def quic_event_received(self, event):
         if isinstance(event, StreamDataReceived):
-            # Throughput mode: just discard
             if self.mode == "throughput":
-                # Could count bytes here if you want server-side stats.
-                pass
-
-            # RTT mode: immediate echo
+                self._handle_throughput_event(event)
             elif self.mode == "rtt":
                 self._quic.send_stream_data(
                     event.stream_id, event.data, end_stream=False
                 )
                 self.transmit()
+
+    def _handle_throughput_event(self, event: StreamDataReceived):
+        state = self._get_stream_state(event.stream_id)
+
+        # If we haven't parsed the control line yet
+        if state["cmd"] is None:
+            state["buffer"] += event.data
+            if b"\n" in state["buffer"]:
+                line, rest = state["buffer"].split(b"\n", 1)
+                parts = line.decode().strip().split()
+                if len(parts) == 2:
+                    state["cmd"] = parts[0]
+                    state["size"] = int(parts[1])
+                    state["start_time"] = time.perf_counter()
+
+                    if state["cmd"] == "DOWNLOAD":
+                        # Send data to client
+                        self._send_download_data(event.stream_id, state["size"])
+                    else:
+                        # UPLOAD: count any remaining buffered data
+                        state["bytes_transferred"] = len(rest)
+                        if event.end_stream:
+                            self._finish_upload(event.stream_id, state)
+            return
+
+        # UPLOAD mode: count received data
+        if state["cmd"] == "UPLOAD":
+            state["bytes_transferred"] += len(event.data)
+            if event.end_stream:
+                self._finish_upload(event.stream_id, state)
+
+        # DOWNLOAD mode: client ACK received
+        elif state["cmd"] == "DOWNLOAD" and event.end_stream:
+            del self._stream_state[event.stream_id]
+
+    def _send_download_data(self, stream_id: int, size: int):
+        """Send requested bytes to client."""
+        chunk_size = 64 * 1024
+        payload = os.urandom(chunk_size)
+        sent = 0
+        while sent < size:
+            remaining = size - sent
+            buf = payload if remaining >= chunk_size else payload[:remaining]
+            end = (sent + len(buf) >= size)
+            self._quic.send_stream_data(stream_id, buf, end_stream=end)
+            sent += len(buf)
+        self.transmit()
+        elapsed = time.perf_counter() - self._stream_state[stream_id]["start_time"]
+        mbps = sent * 8 / max(elapsed, 1e-9) / 1e6
+        print(f"[QUIC throughput] sent {sent} bytes in {elapsed:.3f}s ({mbps:.2f} Mbit/s)",
+              flush=True)
+
+    def _finish_upload(self, stream_id: int, state: dict):
+        """Finish upload: log stats and send ACK."""
+        elapsed = time.perf_counter() - state["start_time"]
+        mbps = state["bytes_transferred"] * 8 / max(elapsed, 1e-9) / 1e6
+        print(f"[QUIC throughput] received {state['bytes_transferred']} bytes "
+              f"in {elapsed:.3f}s ({mbps:.2f} Mbit/s)", flush=True)
+        self._quic.send_stream_data(stream_id, b"OK", end_stream=True)
+        self.transmit()
+        del self._stream_state[stream_id]
 
 
 async def run_quic_server(host: str,
@@ -326,7 +461,7 @@ async def run_quic_server(host: str,
     configuration = QuicConfiguration(
         is_client=False,
         alpn_protocols=["bench"],
-        congestion_control_algorithm="bbr",
+        congestion_control_algorithm=QUIC_CC_ALGORITHM,
     )
     configuration.load_cert_chain(cert, key)
 
@@ -349,7 +484,8 @@ async def tcp_throughput_stream(
     stream_id: int,
     host: str,
     port: int,
-    bytes_to_send: int,
+    num_bytes: int,
+    direction: str = "upload",
     chunk_size: int = 64 * 1024,
 ) -> Optional[ThroughputResult]:
     try:
@@ -357,25 +493,43 @@ async def tcp_throughput_stream(
     except OSError as e:
         print(f"  Stream {stream_id}: connection failed: {e}")
         return None
-    # Use random data to avoid trivial compression by middleboxes.
-    payload = os.urandom(chunk_size)
 
-    sent = 0
-    start = time.perf_counter()
-    while sent < bytes_to_send:
-        remaining = bytes_to_send - sent
-        buf = payload if remaining >= chunk_size else payload[:remaining]
-        writer.write(buf)
-        await writer.drain()
-        sent += len(buf)
-    end = time.perf_counter()
+    # Send control line
+    cmd = "UPLOAD" if direction == "upload" else "DOWNLOAD"
+    writer.write(f"{cmd} {num_bytes}\n".encode())
+    await writer.drain()
+
+    if direction == "upload":
+        # Send data to server
+        payload = os.urandom(chunk_size)
+        sent = 0
+        start = time.perf_counter()
+        while sent < num_bytes:
+            remaining = num_bytes - sent
+            buf = payload if remaining >= chunk_size else payload[:remaining]
+            writer.write(buf)
+            await writer.drain()
+            sent += len(buf)
+        end = time.perf_counter()
+        transferred = sent
+    else:
+        # Receive data from server
+        received = 0
+        start = time.perf_counter()
+        while received < num_bytes:
+            data = await reader.read(chunk_size)
+            if not data:
+                break
+            received += len(data)
+        end = time.perf_counter()
+        transferred = received
 
     writer.close()
     await writer.wait_closed()
 
     duration = max(end - start, 1e-9)
     return ThroughputResult(stream_id=stream_id,
-                            bytes_sent=sent,
+                            bytes_sent=transferred,
                             duration=duration)
 
 
@@ -411,39 +565,84 @@ async def tcp_rtt_stream(
 # QUIC CLIENT
 # -----------------------------
 
-async def quic_throughput_stream(
-    stream_id: int,
-    connection: QuicConnectionProtocol,
-    bytes_to_send: int,
-    chunk_size: int = 64 * 1024,
-) -> ThroughputResult:
-    """
-    One QUIC stream for throughput.
-    """
-    payload = os.urandom(chunk_size)
-    sent = 0
-    quic = connection._quic
+class QuicThroughputClientProtocol(QuicConnectionProtocol):
+    """QUIC client protocol for bidirectional throughput testing."""
 
-    # Allocate a fresh bidirectional stream id for this logical stream_id
-    sid = quic.get_next_available_stream_id(is_unidirectional=False)
-    start = time.perf_counter()
-    try:
-        while sent < bytes_to_send:
-            remaining = bytes_to_send - sent
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._stream_done: dict[int, asyncio.Event] = {}
+        self._stream_bytes: dict[int, int] = {}  # bytes received for download
+
+    def quic_event_received(self, event):
+        if isinstance(event, StreamDataReceived):
+            sid = event.stream_id
+            # Track bytes received (for download)
+            if sid in self._stream_bytes:
+                self._stream_bytes[sid] += len(event.data)
+            # Signal completion when stream ends
+            if event.end_stream and sid in self._stream_done:
+                self._stream_done[sid].set()
+
+    async def send_throughput_data(self, num_bytes: int,
+                                   chunk_size: int = 64 * 1024) -> int:
+        """Upload: send data and wait for server ACK. Returns bytes sent."""
+        quic = self._quic
+        sid = quic.get_next_available_stream_id(is_unidirectional=False)
+        self._stream_done[sid] = asyncio.Event()
+
+        # Send control line
+        quic.send_stream_data(sid, f"UPLOAD {num_bytes}\n".encode(), end_stream=False)
+        self.transmit()
+
+        # Send data
+        payload = os.urandom(chunk_size)
+        sent = 0
+        while sent < num_bytes:
+            remaining = num_bytes - sent
             buf = payload if remaining >= chunk_size else payload[:remaining]
             quic.send_stream_data(sid, buf, end_stream=False)
             sent += len(buf)
-            connection.transmit()
-        # Graceful end-of-stream
-        quic.send_stream_data(sid, b"", end_stream=True)
-        connection.transmit()
-    finally:
-        end = time.perf_counter()
+            self.transmit()
 
-    duration = max(end - start, 1e-9)
-    return ThroughputResult(stream_id=stream_id,
-                            bytes_sent=sent,
-                            duration=duration)
+        # Signal end of stream
+        quic.send_stream_data(sid, b"", end_stream=True)
+        self.transmit()
+
+        # Wait for server ACK
+        try:
+            await asyncio.wait_for(self._stream_done[sid].wait(), timeout=60.0)
+        except asyncio.TimeoutError:
+            print(f"  Warning: timeout waiting for server ACK on stream {sid}")
+
+        del self._stream_done[sid]
+        return sent
+
+    async def receive_throughput_data(self, num_bytes: int) -> int:
+        """Download: request data from server. Returns bytes received."""
+        quic = self._quic
+        sid = quic.get_next_available_stream_id(is_unidirectional=False)
+        self._stream_done[sid] = asyncio.Event()
+        self._stream_bytes[sid] = 0
+
+        # Send control line requesting download
+        quic.send_stream_data(sid, f"DOWNLOAD {num_bytes}\n".encode(), end_stream=False)
+        self.transmit()
+
+        # Wait for server to send all data (ends stream when done)
+        try:
+            await asyncio.wait_for(self._stream_done[sid].wait(), timeout=60.0)
+        except asyncio.TimeoutError:
+            print(f"  Warning: timeout waiting for download on stream {sid}")
+
+        received = self._stream_bytes[sid]
+
+        # Send ACK to server
+        quic.send_stream_data(sid, b"", end_stream=True)
+        self.transmit()
+
+        del self._stream_done[sid]
+        del self._stream_bytes[sid]
+        return received
 
 
 class QuicRTTClientProtocol(QuicConnectionProtocol):
@@ -494,6 +693,7 @@ async def run_quic_throughput_client(
     port: int,
     total_bytes: int,
     streams: int,
+    direction: str = "upload",
     alpn: str = "bench",
     insecure: bool = True,
 ) -> List[ThroughputResult]:
@@ -501,7 +701,7 @@ async def run_quic_throughput_client(
         is_client=True,
         alpn_protocols=[alpn],
         server_name=host,
-        congestion_control_algorithm="bbr",
+        congestion_control_algorithm=QUIC_CC_ALGORITHM,
     )
     # For lab benchmarking we usually allow self-signed certs
     if insecure:
@@ -515,26 +715,39 @@ async def run_quic_throughput_client(
             host,
             port,
             configuration=configuration,
-            create_protocol=QuicConnectionProtocol,
+            create_protocol=QuicThroughputClientProtocol,
         ) as client:
-            client: QuicConnectionProtocol
-            tasks = []
+            client: QuicThroughputClientProtocol
+
+            # Build list of bytes per stream
+            bytes_per_stream_list = []
             for i in range(streams):
-                # Distribute any remainder to the first streams
                 extra = 1 if i < remainder else 0
                 bs = bytes_per_stream + extra
-                if bs == 0:
-                    continue
-                tasks.append(
-                    quic_throughput_stream(
-                        stream_id=i,
-                        connection=client,
-                        bytes_to_send=bs,
-                    )
-                )
-            results = await asyncio.gather(*tasks)
-            # Brief wait for final packets to flush
-            await asyncio.sleep(0.1)
+                if bs > 0:
+                    bytes_per_stream_list.append((i, bs))
+
+            # Transfer data on all streams concurrently
+            start = time.perf_counter()
+            if direction == "upload":
+                tasks = [client.send_throughput_data(bs)
+                         for _, bs in bytes_per_stream_list]
+            else:
+                tasks = [client.receive_throughput_data(bs)
+                         for _, bs in bytes_per_stream_list]
+            bytes_list = await asyncio.gather(*tasks)
+            end = time.perf_counter()
+
+        duration = max(end - start, 1e-9)
+
+        # Build results
+        results = []
+        for (stream_id, _), transferred in zip(bytes_per_stream_list, bytes_list):
+            results.append(ThroughputResult(
+                stream_id=stream_id,
+                bytes_sent=transferred,
+                duration=duration,
+            ))
         return results
     except OSError as e:
         print(f"  QUIC connection failed: {e}")
@@ -554,7 +767,7 @@ async def run_quic_rtt_client(
         is_client=True,
         alpn_protocols=[alpn],
         server_name=host,
-        congestion_control_algorithm="bbr",
+        congestion_control_algorithm=QUIC_CC_ALGORITHM,
     )
     if insecure:
         configuration.verify_mode = False
@@ -593,9 +806,11 @@ async def run_client_throughput(
     total_bytes: int,
     streams: int,
     runs: int,
+    direction: str = "upload",
 ):
+    direction_label = "upload" if direction == "upload" else "download"
     for run in range(1, runs + 1):
-        print(f"\n=== Throughput run {run}/{runs} ({protocol.upper()}) ===")
+        print(f"\n=== Throughput {direction_label} run {run}/{runs} ({protocol.upper()}) ===")
 
         if protocol == "tcp":
             tasks = []
@@ -612,7 +827,8 @@ async def run_client_throughput(
                         stream_id=i,
                         host=host,
                         port=tcp_port,
-                        bytes_to_send=bs,
+                        num_bytes=bs,
+                        direction=direction,
                     )
                 )
             results = await asyncio.gather(*tasks)
@@ -624,6 +840,7 @@ async def run_client_throughput(
                 port=quic_port,
                 total_bytes=total_bytes,
                 streams=streams,
+                direction=direction,
             )
             end = time.perf_counter()
 
@@ -634,15 +851,15 @@ async def run_client_throughput(
             continue
 
         elapsed = max(end - start, 1e-9)
-        total_sent = sum(r.bytes_sent for r in results)
-        total_mbps = total_sent * 8 / elapsed / 1e6
+        total_transferred = sum(r.bytes_sent for r in results)
+        total_mbps = total_transferred * 8 / elapsed / 1e6
 
         for r in results:
             mbps = r.bytes_sent * 8 / r.duration / 1e6
             print(f"  Stream {r.stream_id}: {r.bytes_sent} bytes "
                   f"in {r.duration:.3f}s ({mbps:.2f} Mbit/s)")
 
-        print(f"  TOTAL: {total_sent} bytes in {elapsed:.3f}s "
+        print(f"  TOTAL: {total_transferred} bytes in {elapsed:.3f}s "
               f"({total_mbps:.2f} Mbit/s)")
 
 
@@ -767,8 +984,10 @@ def parse_args():
     sp_client.add_argument("--runs", type=int, default=1,
                            help="Number of times to repeat the test")
     # Throughput options
-    sp_client.add_argument("--bytes", type=int, default=100 * 1024 * 1024,
-                           help="Total bytes per run (throughput mode)")
+    sp_client.add_argument("--bytes", type=str, default="100MB",
+                           help="Total bytes per run, e.g. 100MB, 1G (throughput mode)")
+    sp_client.add_argument("--direction", choices=["upload", "download", "both"],
+                           default="upload", help="Data direction (throughput mode)")
     # RTT options
     sp_client.add_argument("--pings", type=int, default=100,
                            help="Number of pings per stream (rtt mode)")
@@ -848,19 +1067,29 @@ async def main_async():
             protocols = [args.protocol]
 
         if args.mode == "throughput":
-            if args.bytes < args.streams:
-                print(f"Error: --bytes ({args.bytes}) must be >= --streams ({args.streams})")
+            total_bytes = parse_size(args.bytes)
+            if total_bytes < args.streams:
+                print(f"Error: --bytes ({total_bytes}) must be >= --streams ({args.streams})")
                 return
+
+            # Determine which directions to test
+            if args.direction == "both":
+                directions = ["upload", "download"]
+            else:
+                directions = [args.direction]
+
             for protocol in protocols:
-                await run_client_throughput(
-                    protocol=protocol,
-                    host=args.server_host,
-                    tcp_port=args.tcp_port,
-                    quic_port=args.quic_port,
-                    total_bytes=args.bytes,
-                    streams=args.streams,
-                    runs=args.runs,
-                )
+                for direction in directions:
+                    await run_client_throughput(
+                        protocol=protocol,
+                        host=args.server_host,
+                        tcp_port=args.tcp_port,
+                        quic_port=args.quic_port,
+                        total_bytes=total_bytes,
+                        streams=args.streams,
+                        runs=args.runs,
+                        direction=direction,
+                    )
         else:
             for protocol in protocols:
                 await run_client_rtt(

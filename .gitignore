@@ -18,6 +18,7 @@ build/
 .vscode/
 *.swp
 *.swo
+codefield.md
 
 # TLS certificates (generated for testing)
 *.pem

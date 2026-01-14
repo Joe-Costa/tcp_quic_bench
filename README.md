@@ -85,7 +85,8 @@ Network impairment only affects traffic on the benchmark ports, not other traffi
 | `--mode` | throughput | Benchmark mode: throughput or rtt |
 | `--streams` | 1 | Number of parallel streams |
 | `--runs` | 1 | Number of test iterations |
-| `--bytes` | 100MB | Total bytes to send (throughput mode) |
+| `--bytes` | 100MB | Data size (supports K, KB, M, MB, G, GB, T, TB) |
+| `--direction` | upload | Data direction: upload, download, or both |
 | `--pings` | 100 | Number of pings per stream (rtt mode) |
 | `--message-size` | 64 | Ping message size in bytes (rtt mode) |
 
@@ -102,7 +103,21 @@ Client:
 ```bash
 # Run both protocols back-to-back
 python tcp_quic_bench.py client --server-host myserver.local --protocol both \
-  --mode throughput --bytes 100000000 --streams 4
+  --mode throughput --bytes 100MB --streams 4
+```
+
+### Bidirectional throughput test
+
+Server:
+```bash
+python tcp_quic_bench.py server --mode throughput
+```
+
+Client:
+```bash
+# Test upload and download in sequence
+python tcp_quic_bench.py client --server-host myserver.local --protocol both \
+  --direction both --bytes 1GB --streams 4
 ```
 
 ### Measure latency with jitter
@@ -128,7 +143,7 @@ python tcp_quic_bench.py server --mode throughput
 Client:
 ```bash
 python tcp_quic_bench.py client --server-host myserver.local --protocol quic \
-  --mode throughput --bytes 10737418240 --streams 16 --runs 5
+  --mode throughput --bytes 10G --streams 16 --runs 5
 ```
 
 ## Output
@@ -136,10 +151,15 @@ python tcp_quic_bench.py client --server-host myserver.local --protocol quic \
 ### Throughput Mode
 
 ```
-=== Throughput run 1/1 (TCP) ===
+=== Throughput upload run 1/1 (TCP) ===
   Stream 0: 50000000 bytes in 0.892s (448.43 Mbit/s)
   Stream 1: 50000000 bytes in 0.887s (451.07 Mbit/s)
   TOTAL: 100000000 bytes in 0.921s (868.62 Mbit/s)
+
+=== Throughput download run 1/1 (TCP) ===
+  Stream 0: 50000000 bytes in 0.845s (473.37 Mbit/s)
+  Stream 1: 50000000 bytes in 0.851s (470.03 Mbit/s)
+  TOTAL: 100000000 bytes in 0.876s (913.24 Mbit/s)
 ```
 
 ### RTT Mode
@@ -152,7 +172,8 @@ python tcp_quic_bench.py client --server-host myserver.local --protocol quic \
 
 ## Notes
 
-- BBR congestion control is used by default (QUIC always, TCP when server runs as root on Linux)
+- BBR congestion control is used when available (requires aioquic with BBR support; falls back to Reno)
+- TCP BBR is set via sysctl when server runs as root on Linux
 - TCP parallel streams use separate connections; QUIC uses multiple streams over one connection
 - Network impairment uses Linux tc/netem and requires root privileges
 - The tool cleans up tc rules automatically on exit (Ctrl+C or normal termination)
