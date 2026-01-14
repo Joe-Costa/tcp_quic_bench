@@ -11,14 +11,20 @@ Modes:
   - throughput: client sends data to server; measures throughput.
   - rtt: client sends small messages and expects echo; measures RTT.
 
-QUIC uses aioquic. Packet loss and latency are expected to be induced
-externally via `tc netem` on the Linux server side, not in this script.
+QUIC uses aioquic. Packet loss and latency can be induced via tc netem
+on the Linux server side, either externally or using the --netem-* options
+(requires root on Linux).
 """
 
 import argparse
 import asyncio
+import atexit
 import os
+import platform
+import signal
 import statistics
+import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from typing import List, Optional
@@ -45,6 +51,161 @@ class ThroughputResult:
 class RTTResult:
     stream_id: int
     rtts: List[float]
+
+
+# -----------------------------
+# Network Impairment Controller
+# -----------------------------
+
+class NetemController:
+    """
+    Manages tc netem rules for benchmark traffic only.
+
+    Applies network impairments (delay, jitter, loss) to specific ports
+    using Linux tc with u32 filters. Requires root privileges on Linux.
+    """
+
+    def __init__(self, interface: Optional[str], tcp_port: int, udp_port: int):
+        self.interface = interface
+        self.tcp_port = tcp_port
+        self.udp_port = udp_port
+        self._applied = False
+
+    def check_prerequisites(self) -> None:
+        """Check that we're on Linux with root privileges."""
+        if platform.system() != "Linux":
+            raise RuntimeError(
+                "Network impairment via tc requires Linux. "
+                "On other platforms, use external tools or run server on Linux."
+            )
+        if os.geteuid() != 0:
+            raise RuntimeError(
+                "Network impairment via tc requires root privileges. "
+                "Run with sudo or as root."
+            )
+
+    def detect_interface(self) -> str:
+        """Auto-detect the default network interface."""
+        try:
+            # Use ip route to find the default interface
+            result = subprocess.run(
+                ["ip", "route", "get", "8.8.8.8"],
+                capture_output=True, text=True, check=True
+            )
+            # Parse output: "8.8.8.8 via 192.168.1.1 dev eth0 src ..."
+            for part in result.stdout.split():
+                if part.startswith("dev"):
+                    continue
+                # The word after "dev" is the interface
+                parts = result.stdout.split()
+                if "dev" in parts:
+                    idx = parts.index("dev")
+                    if idx + 1 < len(parts):
+                        return parts[idx + 1]
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            pass
+
+        # Fallback: try common interface names
+        for iface in ["eth0", "ens33", "enp0s3", "ens160"]:
+            if os.path.exists(f"/sys/class/net/{iface}"):
+                return iface
+
+        raise RuntimeError(
+            "Could not auto-detect network interface. "
+            "Please specify with --netem-iface."
+        )
+
+    def _run_tc(self, args: List[str], check: bool = True) -> bool:
+        """Run a tc command."""
+        cmd = ["tc"] + args
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, check=check)
+            return True
+        except subprocess.CalledProcessError as e:
+            if check:
+                print(f"tc command failed: {' '.join(cmd)}")
+                print(f"stderr: {e.stderr}")
+            return False
+
+    def apply(self, delay_ms: Optional[int], jitter_ms: Optional[int],
+              loss_pct: Optional[float]) -> None:
+        """Apply netem rules to benchmark ports."""
+        if self.interface is None:
+            self.interface = self.detect_interface()
+
+        # Build netem parameters
+        netem_params = []
+        if delay_ms is not None:
+            if jitter_ms is not None:
+                netem_params.extend(["delay", f"{delay_ms}ms", f"{jitter_ms}ms"])
+            else:
+                netem_params.extend(["delay", f"{delay_ms}ms"])
+        if loss_pct is not None and loss_pct > 0:
+            netem_params.extend(["loss", f"{loss_pct}%"])
+
+        if not netem_params:
+            return  # Nothing to apply
+
+        # Clean up any existing rules first
+        self._run_tc(["qdisc", "del", "dev", self.interface, "root"], check=False)
+
+        # Add root prio qdisc
+        if not self._run_tc(["qdisc", "add", "dev", self.interface,
+                             "root", "handle", "1:", "prio"]):
+            raise RuntimeError("Failed to add root qdisc")
+
+        # TCP filter and netem (protocol 6 = TCP)
+        self._run_tc([
+            "filter", "add", "dev", self.interface,
+            "protocol", "ip", "parent", "1:0", "prio", "1", "u32",
+            "match", "ip", "protocol", "6", "0xff",
+            "match", "ip", "dport", str(self.tcp_port), "0xffff",
+            "flowid", "1:1"
+        ])
+        self._run_tc([
+            "qdisc", "add", "dev", self.interface,
+            "parent", "1:1", "handle", "10:", "netem"
+        ] + netem_params)
+
+        # UDP filter and netem (protocol 17 = UDP)
+        self._run_tc([
+            "filter", "add", "dev", self.interface,
+            "protocol", "ip", "parent", "1:0", "prio", "2", "u32",
+            "match", "ip", "protocol", "17", "0xff",
+            "match", "ip", "dport", str(self.udp_port), "0xffff",
+            "flowid", "1:2"
+        ])
+        self._run_tc([
+            "qdisc", "add", "dev", self.interface,
+            "parent", "1:2", "handle", "20:", "netem"
+        ] + netem_params)
+
+        self._applied = True
+        print(f"[netem] Applied to {self.interface}: {' '.join(netem_params)}")
+        print(f"[netem] Affecting TCP port {self.tcp_port}, UDP port {self.udp_port}")
+
+    def cleanup(self) -> None:
+        """Remove all tc rules."""
+        if not self._applied:
+            return
+        if self.interface:
+            self._run_tc(["qdisc", "del", "dev", self.interface, "root"], check=False)
+            print(f"[netem] Cleaned up rules on {self.interface}")
+        self._applied = False
+
+
+# Global controller for signal handler access
+_netem_controller: Optional[NetemController] = None
+
+
+def _netem_cleanup_handler(signum=None, frame=None):
+    """Signal handler to clean up netem rules."""
+    global _netem_controller
+    if _netem_controller:
+        _netem_controller.cleanup()
+        _netem_controller = None
+    if signum is not None:
+        sys.exit(0)
 
 
 # -----------------------------
@@ -313,6 +474,7 @@ async def run_quic_throughput_client(
     configuration = QuicConfiguration(
         is_client=True,
         alpn_protocols=[alpn],
+        server_name=host,
     )
     # For lab benchmarking we usually allow self-signed certs
     if insecure:
@@ -327,7 +489,6 @@ async def run_quic_throughput_client(
             port,
             configuration=configuration,
             create_protocol=QuicConnectionProtocol,
-            server_name=host,
         ) as client:
             client: QuicConnectionProtocol
             tasks = []
@@ -365,6 +526,7 @@ async def run_quic_rtt_client(
     configuration = QuicConfiguration(
         is_client=True,
         alpn_protocols=[alpn],
+        server_name=host,
     )
     if insecure:
         configuration.verify_mode = False
@@ -375,7 +537,6 @@ async def run_quic_rtt_client(
             port,
             configuration=configuration,
             create_protocol=QuicRTTClientProtocol,
-            server_name=host,
         ) as client:
             client: QuicRTTClientProtocol
             tasks = []
@@ -550,6 +711,15 @@ def parse_args():
                            help="QUIC TLS certificate file")
     sp_server.add_argument("--quic-key", default="key.pem",
                            help="QUIC TLS key file")
+    # Network impairment options (Linux root only)
+    sp_server.add_argument("--netem-iface", default=None,
+                           help="Network interface for tc rules (auto-detect if not set)")
+    sp_server.add_argument("--netem-delay", type=int, default=None,
+                           help="Add network delay in ms (e.g., 50)")
+    sp_server.add_argument("--netem-jitter", type=int, default=None,
+                           help="Add jitter in ms (requires --netem-delay)")
+    sp_server.add_argument("--netem-loss", type=float, default=None,
+                           help="Add packet loss percentage (e.g., 2.0)")
 
     # Client
     sp_client = subparsers.add_parser("client", help="Run in client mode")
@@ -584,6 +754,41 @@ async def main_async():
     args = parse_args()
 
     if args.role == "server":
+        global _netem_controller
+
+        # Setup network impairment if requested
+        netem_requested = any([
+            args.netem_delay is not None,
+            args.netem_loss is not None,
+        ])
+        if netem_requested:
+            # Validate jitter requires delay
+            if args.netem_jitter is not None and args.netem_delay is None:
+                print("Error: --netem-jitter requires --netem-delay")
+                return
+
+            controller = NetemController(
+                interface=args.netem_iface,
+                tcp_port=args.tcp_port,
+                udp_port=args.quic_port,
+            )
+            try:
+                controller.check_prerequisites()
+                controller.apply(
+                    delay_ms=args.netem_delay,
+                    jitter_ms=args.netem_jitter,
+                    loss_pct=args.netem_loss,
+                )
+                _netem_controller = controller
+
+                # Register cleanup handlers
+                signal.signal(signal.SIGINT, _netem_cleanup_handler)
+                signal.signal(signal.SIGTERM, _netem_cleanup_handler)
+                atexit.register(_netem_cleanup_handler)
+            except RuntimeError as e:
+                print(f"Error: {e}")
+                return
+
         tasks = []
         if args.protocol in ("tcp", "both"):
             tasks.append(run_tcp_server(args.host, args.tcp_port, args.mode))
@@ -597,7 +802,12 @@ async def main_async():
                     key=args.quic_key,
                 )
             )
-        await asyncio.gather(*tasks)
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            if _netem_controller:
+                _netem_controller.cleanup()
+                _netem_controller = None
 
     elif args.role == "client":
         if args.mode == "throughput":
