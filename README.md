@@ -81,7 +81,7 @@ Network impairment only affects traffic on the benchmark ports, not other traffi
 | `--server-host` | (required) | Server hostname or IP |
 | `--tcp-port` | 5000 | TCP server port |
 | `--quic-port` | 5001 | QUIC server port |
-| `--protocol` | (required) | Protocol to test: tcp or quic |
+| `--protocol` | (required) | Protocol to test: tcp, quic, or both |
 | `--mode` | throughput | Benchmark mode: throughput or rtt |
 | `--streams` | 1 | Number of parallel streams |
 | `--runs` | 1 | Number of test iterations |
@@ -100,12 +100,8 @@ sudo python tcp_quic_bench.py server --mode throughput --netem-delay 20 --netem-
 
 Client:
 ```bash
-# Test TCP
-python tcp_quic_bench.py client --server-host myserver.local --protocol tcp \
-  --mode throughput --bytes 100000000 --streams 4
-
-# Test QUIC
-python tcp_quic_bench.py client --server-host myserver.local --protocol quic \
+# Run both protocols back-to-back
+python tcp_quic_bench.py client --server-host myserver.local --protocol both \
   --mode throughput --bytes 100000000 --streams 4
 ```
 
@@ -156,6 +152,7 @@ python tcp_quic_bench.py client --server-host myserver.local --protocol quic \
 
 ## Notes
 
+- BBR congestion control is used by default (QUIC always, TCP when server runs as root on Linux)
 - TCP parallel streams use separate connections; QUIC uses multiple streams over one connection
 - Network impairment uses Linux tc/netem and requires root privileges
 - The tool cleans up tc rules automatically on exit (Ctrl+C or normal termination)

@@ -54,6 +54,31 @@ class RTTResult:
 
 
 # -----------------------------
+# TCP Congestion Control
+# -----------------------------
+
+def set_tcp_congestion_control(algorithm: str = "bbr") -> bool:
+    """
+    Set TCP congestion control algorithm (Linux only, requires root).
+    Returns True if successful, False otherwise.
+    """
+    if platform.system() != "Linux":
+        return False
+    if os.geteuid() != 0:
+        return False
+
+    try:
+        subprocess.run(
+            ["sysctl", "-w", f"net.ipv4.tcp_congestion_control={algorithm}"],
+            capture_output=True, check=True
+        )
+        print(f"[tcp] Congestion control set to {algorithm}")
+        return True
+    except subprocess.CalledProcessError:
+        return False
+
+
+# -----------------------------
 # Network Impairment Controller
 # -----------------------------
 
@@ -301,6 +326,7 @@ async def run_quic_server(host: str,
     configuration = QuicConfiguration(
         is_client=False,
         alpn_protocols=["bench"],
+        congestion_control_algorithm="bbr",
     )
     configuration.load_cert_chain(cert, key)
 
@@ -475,6 +501,7 @@ async def run_quic_throughput_client(
         is_client=True,
         alpn_protocols=[alpn],
         server_name=host,
+        congestion_control_algorithm="bbr",
     )
     # For lab benchmarking we usually allow self-signed certs
     if insecure:
@@ -527,6 +554,7 @@ async def run_quic_rtt_client(
         is_client=True,
         alpn_protocols=[alpn],
         server_name=host,
+        congestion_control_algorithm="bbr",
     )
     if insecure:
         configuration.verify_mode = False
@@ -729,7 +757,7 @@ def parse_args():
                            help="TCP port (default: 5000)")
     sp_client.add_argument("--quic-port", type=int, default=5001,
                            help="QUIC UDP port (default: 5001)")
-    sp_client.add_argument("--protocol", choices=["tcp", "quic"],
+    sp_client.add_argument("--protocol", choices=["tcp", "quic", "both"],
                            required=True, help="Protocol to benchmark")
     sp_client.add_argument("--mode", choices=["throughput", "rtt"],
                            default="throughput", help="Benchmark mode")
@@ -755,6 +783,9 @@ async def main_async():
 
     if args.role == "server":
         global _netem_controller
+
+        # Set TCP congestion control to BBR (Linux root only, silent fail otherwise)
+        set_tcp_congestion_control("bbr")
 
         # Setup network impairment if requested
         netem_requested = any([
@@ -810,30 +841,38 @@ async def main_async():
                 _netem_controller = None
 
     elif args.role == "client":
+        # Determine which protocols to run
+        if args.protocol == "both":
+            protocols = ["tcp", "quic"]
+        else:
+            protocols = [args.protocol]
+
         if args.mode == "throughput":
             if args.bytes < args.streams:
                 print(f"Error: --bytes ({args.bytes}) must be >= --streams ({args.streams})")
                 return
-            await run_client_throughput(
-                protocol=args.protocol,
-                host=args.server_host,
-                tcp_port=args.tcp_port,
-                quic_port=args.quic_port,
-                total_bytes=args.bytes,
-                streams=args.streams,
-                runs=args.runs,
-            )
+            for protocol in protocols:
+                await run_client_throughput(
+                    protocol=protocol,
+                    host=args.server_host,
+                    tcp_port=args.tcp_port,
+                    quic_port=args.quic_port,
+                    total_bytes=args.bytes,
+                    streams=args.streams,
+                    runs=args.runs,
+                )
         else:
-            await run_client_rtt(
-                protocol=args.protocol,
-                host=args.server_host,
-                tcp_port=args.tcp_port,
-                quic_port=args.quic_port,
-                streams=args.streams,
-                pings=args.pings,
-                message_size=args.message_size,
-                runs=args.runs,
-            )
+            for protocol in protocols:
+                await run_client_rtt(
+                    protocol=protocol,
+                    host=args.server_host,
+                    tcp_port=args.tcp_port,
+                    quic_port=args.quic_port,
+                    streams=args.streams,
+                    pings=args.pings,
+                    message_size=args.message_size,
+                    runs=args.runs,
+                )
 
 
 def main():
