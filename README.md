@@ -152,14 +152,14 @@ python tcp_quic_bench.py client --server-host myserver.local --protocol quic \
 
 ```
 === Throughput upload run 1/1 (TCP) ===
-  Stream 0: 50000000 bytes in 0.892s (448.43 Mbit/s)
-  Stream 1: 50000000 bytes in 0.887s (451.07 Mbit/s)
-  TOTAL: 100000000 bytes in 0.921s (868.62 Mbit/s)
+  Stream 0: 50 MB in 0.892s (448.43 Mbit/s)
+  Stream 1: 50 MB in 0.887s (451.07 Mbit/s)
+  TOTAL: 100 MB in 0.921s (868.62 Mbit/s)
 
 === Throughput download run 1/1 (TCP) ===
-  Stream 0: 50000000 bytes in 0.845s (473.37 Mbit/s)
-  Stream 1: 50000000 bytes in 0.851s (470.03 Mbit/s)
-  TOTAL: 100000000 bytes in 0.876s (913.24 Mbit/s)
+  Stream 0: 50 MB in 0.845s (473.37 Mbit/s)
+  Stream 1: 50 MB in 0.851s (470.03 Mbit/s)
+  TOTAL: 100 MB in 0.876s (913.24 Mbit/s)
 ```
 
 ### RTT Mode

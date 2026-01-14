@@ -46,6 +46,8 @@ def _get_quic_cc_algorithm() -> str:
         return "reno"
 
 QUIC_CC_ALGORITHM = _get_quic_cc_algorithm()
+# Log at import time so it's visible
+print(f"[quic] Congestion control: {QUIC_CC_ALGORITHM}")
 
 
 # -----------------------------
@@ -54,13 +56,44 @@ QUIC_CC_ALGORITHM = _get_quic_cc_algorithm()
 
 def parse_size(s: str) -> int:
     """Parse human-readable size (e.g., '100MB', '1G', '500K') to bytes."""
+    if not s or not s.strip():
+        raise ValueError("Size cannot be empty")
     s = s.strip().upper()
     units = {'B': 1, 'K': 1024, 'KB': 1024, 'M': 1024**2, 'MB': 1024**2,
              'G': 1024**3, 'GB': 1024**3, 'T': 1024**4, 'TB': 1024**4}
     for suffix, mult in sorted(units.items(), key=lambda x: -len(x[0])):
         if s.endswith(suffix):
-            return int(float(s[:-len(suffix)]) * mult)
-    return int(s)  # Assume bytes if no suffix
+            num_part = s[:-len(suffix)].strip()
+            if not num_part:
+                raise ValueError(f"Invalid size: {s!r}")
+            try:
+                value = int(float(num_part) * mult)
+            except ValueError:
+                raise ValueError(f"Invalid number in size: {s!r}")
+            if value < 0:
+                raise ValueError(f"Size cannot be negative: {s!r}")
+            return value
+    # No suffix - assume bytes
+    try:
+        value = int(s)
+    except ValueError:
+        raise ValueError(f"Invalid size: {s!r}")
+    if value < 0:
+        raise ValueError(f"Size cannot be negative: {s!r}")
+    return value
+
+
+def format_size(num_bytes: int) -> str:
+    """Format bytes as human-readable size."""
+    for unit, threshold in [('TB', 1024**4), ('GB', 1024**3),
+                            ('MB', 1024**2), ('KB', 1024)]:
+        if num_bytes >= threshold:
+            value = num_bytes / threshold
+            # Use integer if it's a whole number, otherwise 2 decimal places
+            if value == int(value):
+                return f"{int(value)} {unit}"
+            return f"{value:.2f} {unit}"
+    return f"{num_bytes} bytes"
 
 
 # -----------------------------
@@ -84,15 +117,25 @@ class RTTResult:
 # TCP Congestion Control
 # -----------------------------
 
-def set_tcp_congestion_control(algorithm: str = "bbr") -> bool:
+def set_tcp_congestion_control(algorithm: str = "bbr") -> str:
     """
     Set TCP congestion control algorithm (Linux only, requires root).
-    Returns True if successful, False otherwise.
+    Returns the algorithm in use (requested or system default).
     """
     if platform.system() != "Linux":
-        return False
+        return "unknown (not Linux)"
     if os.geteuid() != 0:
-        return False
+        # Try to read current setting
+        try:
+            result = subprocess.run(
+                ["sysctl", "-n", "net.ipv4.tcp_congestion_control"],
+                capture_output=True, text=True, check=True
+            )
+            current = result.stdout.strip()
+            print(f"[tcp] Congestion control: {current} (not root, cannot change)")
+            return current
+        except subprocess.CalledProcessError:
+            return "unknown"
 
     try:
         subprocess.run(
@@ -100,9 +143,19 @@ def set_tcp_congestion_control(algorithm: str = "bbr") -> bool:
             capture_output=True, check=True
         )
         print(f"[tcp] Congestion control set to {algorithm}")
-        return True
+        return algorithm
     except subprocess.CalledProcessError:
-        return False
+        # BBR might not be available, read current
+        try:
+            result = subprocess.run(
+                ["sysctl", "-n", "net.ipv4.tcp_congestion_control"],
+                capture_output=True, text=True, check=True
+            )
+            current = result.stdout.strip()
+            print(f"[tcp] Congestion control: {current} ({algorithm} not available)")
+            return current
+        except subprocess.CalledProcessError:
+            return "unknown"
 
 
 # -----------------------------
@@ -206,7 +259,8 @@ class NetemController:
                              "root", "handle", "1:", "prio"]):
             raise RuntimeError("Failed to add root qdisc")
 
-        # TCP filter and netem (protocol 6 = TCP)
+        # TCP filters and netem (protocol 6 = TCP)
+        # Filter 1: client->server (dport match)
         self._run_tc([
             "filter", "add", "dev", self.interface,
             "protocol", "ip", "parent", "1:0", "prio", "1", "u32",
@@ -214,17 +268,34 @@ class NetemController:
             "match", "ip", "dport", str(self.tcp_port), "0xffff",
             "flowid", "1:1"
         ])
+        # Filter 2: server->client (sport match)
+        self._run_tc([
+            "filter", "add", "dev", self.interface,
+            "protocol", "ip", "parent", "1:0", "prio", "1", "u32",
+            "match", "ip", "protocol", "6", "0xff",
+            "match", "ip", "sport", str(self.tcp_port), "0xffff",
+            "flowid", "1:1"
+        ])
         self._run_tc([
             "qdisc", "add", "dev", self.interface,
             "parent", "1:1", "handle", "10:", "netem"
         ] + netem_params)
 
-        # UDP filter and netem (protocol 17 = UDP)
+        # UDP filters and netem (protocol 17 = UDP)
+        # Filter 1: client->server (dport match)
         self._run_tc([
             "filter", "add", "dev", self.interface,
             "protocol", "ip", "parent", "1:0", "prio", "2", "u32",
             "match", "ip", "protocol", "17", "0xff",
             "match", "ip", "dport", str(self.udp_port), "0xffff",
+            "flowid", "1:2"
+        ])
+        # Filter 2: server->client (sport match)
+        self._run_tc([
+            "filter", "add", "dev", self.interface,
+            "protocol", "ip", "parent", "1:0", "prio", "2", "u32",
+            "match", "ip", "protocol", "17", "0xff",
+            "match", "ip", "sport", str(self.udp_port), "0xffff",
             "flowid", "1:2"
         ])
         self._run_tc([
@@ -297,6 +368,9 @@ async def handle_tcp_throughput(reader: asyncio.StreamReader,
             mbps = total * 8 / duration / 1e6
             print(f"[TCP throughput] {addr} -> received {total} bytes "
                   f"in {duration:.3f}s ({mbps:.2f} Mbit/s)")
+            # Send ACK so client knows data arrived
+            writer.write(b"OK\n")
+            await writer.drain()
 
         elif cmd == "DOWNLOAD":
             # Send data to client
@@ -370,6 +444,17 @@ class BenchmarkQuicServerProtocol(QuicConnectionProtocol):
         # Per-stream state for throughput
         self._stream_state: dict[int, dict] = {}
 
+    def connection_lost(self, exc: Optional[Exception]) -> None:
+        """Clean up stream state when connection closes."""
+        if self._stream_state:
+            # Log incomplete streams for debugging
+            for sid, state in self._stream_state.items():
+                if state.get("bytes_transferred", 0) > 0:
+                    print(f"[QUIC] Connection lost with incomplete stream {sid}: "
+                          f"{state['bytes_transferred']} bytes transferred")
+            self._stream_state.clear()
+        super().connection_lost(exc)
+
     def _get_stream_state(self, stream_id: int) -> dict:
         if stream_id not in self._stream_state:
             self._stream_state[stream_id] = {
@@ -421,12 +506,17 @@ class BenchmarkQuicServerProtocol(QuicConnectionProtocol):
             if event.end_stream:
                 self._finish_upload(event.stream_id, state)
 
-        # DOWNLOAD mode: client ACK received
+        # DOWNLOAD mode: client ACK received - now we can measure actual transfer time
         elif state["cmd"] == "DOWNLOAD" and event.end_stream:
+            elapsed = time.perf_counter() - state["start_time"]
+            sent = state["bytes_transferred"]
+            mbps = sent * 8 / max(elapsed, 1e-9) / 1e6
+            print(f"[QUIC throughput] sent {sent} bytes in {elapsed:.3f}s ({mbps:.2f} Mbit/s)",
+                  flush=True)
             del self._stream_state[event.stream_id]
 
     def _send_download_data(self, stream_id: int, size: int):
-        """Send requested bytes to client."""
+        """Queue data to send to client. Stats logged when client ACK received."""
         chunk_size = 64 * 1024
         payload = os.urandom(chunk_size)
         sent = 0
@@ -437,10 +527,8 @@ class BenchmarkQuicServerProtocol(QuicConnectionProtocol):
             self._quic.send_stream_data(stream_id, buf, end_stream=end)
             sent += len(buf)
         self.transmit()
-        elapsed = time.perf_counter() - self._stream_state[stream_id]["start_time"]
-        mbps = sent * 8 / max(elapsed, 1e-9) / 1e6
-        print(f"[QUIC throughput] sent {sent} bytes in {elapsed:.3f}s ({mbps:.2f} Mbit/s)",
-              flush=True)
+        # Store bytes sent for logging when client ACK arrives
+        self._stream_state[stream_id]["bytes_transferred"] = sent
 
     def _finish_upload(self, stream_id: int, state: dict):
         """Finish upload: log stats and send ACK."""
@@ -510,6 +598,8 @@ async def tcp_throughput_stream(
             writer.write(buf)
             await writer.drain()
             sent += len(buf)
+        # Wait for server ACK to measure actual delivery time (not just buffer handoff)
+        await reader.readline()
         end = time.perf_counter()
         transferred = sent
     else:
@@ -856,10 +946,10 @@ async def run_client_throughput(
 
         for r in results:
             mbps = r.bytes_sent * 8 / r.duration / 1e6
-            print(f"  Stream {r.stream_id}: {r.bytes_sent} bytes "
+            print(f"  Stream {r.stream_id}: {format_size(r.bytes_sent)} "
                   f"in {r.duration:.3f}s ({mbps:.2f} Mbit/s)")
 
-        print(f"  TOTAL: {total_transferred} bytes in {elapsed:.3f}s "
+        print(f"  TOTAL: {format_size(total_transferred)} in {elapsed:.3f}s "
               f"({total_mbps:.2f} Mbit/s)")
 
 
@@ -1067,7 +1157,11 @@ async def main_async():
             protocols = [args.protocol]
 
         if args.mode == "throughput":
-            total_bytes = parse_size(args.bytes)
+            try:
+                total_bytes = parse_size(args.bytes)
+            except ValueError as e:
+                print(f"Error: {e}")
+                return
             if total_bytes < args.streams:
                 print(f"Error: --bytes ({total_bytes}) must be >= --streams ({args.streams})")
                 return
