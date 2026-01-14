@@ -1,0 +1,32 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# TLS certificates (generated for testing)
+*.pem
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test/benchmark output
+*.log
+*.csv
+*.json
