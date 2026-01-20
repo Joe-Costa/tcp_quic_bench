@@ -2,6 +2,8 @@
 
 A benchmarking tool for comparing TCP and QUIC protocol performance under various network conditions.
 
+This thing doesn't quite work right now, so...
+
 ## Features
 
 - Measure throughput (data transfer speed) and RTT latency (round-trip time)
